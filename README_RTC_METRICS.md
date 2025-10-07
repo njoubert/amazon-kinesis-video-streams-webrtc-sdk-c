@@ -12,6 +12,57 @@ Internally, metrics are updated as packets are processed:
 * Remote inbound statistics such as `fractionLost` and `roundTripTime` are updated each time a Receiver Report is parsed from the remote peer.【F:src/source/PeerConnection/Rtcp.c†L100-L142】【F:src/include/com/amazonaws/kinesis/video/webrtcclient/Stats.h†L401-L417】
 * ICE candidate/candidate pair data are filled from the ICE agent’s diagnostics cache when requested.【F:src/source/Metrics/Metrics.c†L8-L118】
 
+### Iterating media transceivers and data channels
+
+Media transceivers are stored on the peer connection in a doubly linked list while SCTP data channels live in a hash table keyed by the channel id.【F:src/source/PeerConnection/PeerConnection.h†L91-L125】 The metrics helpers already use these containers internally, so you can follow the same iteration patterns to gather stats for every active stream.【F:src/source/Metrics/Metrics.c†L135-L220】【F:src/source/PeerConnection/PeerConnection.c†L85-L126】 For data channels, call `getDataChannelStats` with each identifier to populate `RtcDataChannelStats`.【F:src/source/Metrics/Metrics.c†L206-L220】
+
+The snippet below combines both loops. It walks every transceiver, collects inbound RTP metrics, then iterates the data-channel hash table and fetches per-channel stats via a callback:
+
+```c
+STATUS collectDataChannelStatsCallback(UINT64 customData, PHashEntry pHashEntry)
+{
+    PRtcPeerConnection pPeerConnection = (PRtcPeerConnection) customData;
+    RtcDataChannelStats dcStats;
+
+    MEMSET(&dcStats, 0, SIZEOF(dcStats));
+    dcStats.dataChannelIdentifier = (UINT32) pHashEntry->key;
+    CHK_STATUS(getDataChannelStats(pPeerConnection, &dcStats));
+
+    // Consume dcStats here (log, aggregate, etc.)
+    return STATUS_SUCCESS;
+}
+
+STATUS sampleCollectAllStats(PRtcPeerConnection pPeerConnection)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    PKvsPeerConnection pImpl = (PKvsPeerConnection) pPeerConnection;
+    PDoubleListNode node = NULL;
+
+    CHK_STATUS(doubleListGetHeadNode(pImpl->pTransceivers, &node));
+    while (node != NULL) {
+        UINT64 data = 0;
+        PRtcRtpTransceiver transceiver = NULL;
+        RtcStats transceiverStats;
+
+        CHK_STATUS(doubleListGetNodeData(node, &data));
+        transceiver = (PRtcRtpTransceiver) data;
+
+        MEMSET(&transceiverStats, 0, SIZEOF(transceiverStats));
+        transceiverStats.requestedTypeOfStats = RTC_STATS_TYPE_INBOUND_RTP;
+        CHK_STATUS(rtcPeerConnectionGetMetrics(pPeerConnection, transceiver, &transceiverStats));
+
+        // Use transceiverStats.rtcStatsObject.inboundRtpStreamStats as needed
+        node = node->pNext;
+    }
+
+    CHK_STATUS(hashTableIterateEntries(pImpl->pDataChannels, (UINT64) pPeerConnection, collectDataChannelStatsCallback));
+CleanUp:
+    return retStatus;
+}
+```
+
+This pattern guarantees that each active media and data stream is polled exactly once per pass, producing a complete metrics snapshot you can log or feed into your monitoring pipeline.【F:src/source/Metrics/Metrics.c†L135-L220】【F:src/source/Metrics/Metrics.c†L206-L220】【F:src/source/PeerConnection/PeerConnection.c†L85-L126】
+
 ### Expected Freshness of Data
 
 * **Outbound RTCP sender reports:** Each transceiver schedules its first report ~3 seconds after it starts, then reschedules future reports every 100–300 ms (200 ms ±100 ms jitter).【F:src/source/PeerConnection/PeerConnection.c†L733-L806】【F:src/source/Rtcp/RtcpPacket.h†L35-L38】 These reports drive the remote peer’s packet loss calculations.
